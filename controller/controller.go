@@ -3,8 +3,11 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -200,7 +203,7 @@ func getDoctorHelper(specialization string) ([]model.Doctor, error) {
 }
 
 // Function to get doctor details based on specialization
-// http://localhost:9090/user/getdoc?specialization=<Write_Specialization_here>
+// http://localhost:9091/user/getdoc?specialization=<Write_Specialization_here>
 func GetDoctorDetails(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	specialization := r.URL.Query().Get("specialization")
@@ -212,4 +215,154 @@ func GetDoctorDetails(w http.ResponseWriter, r *http.Request) {
 	}
 	json.NewEncoder(w).Encode(doctors)
 
+}
+
+func validateBookingDetails(doctorid string, date string, starttime int) error {
+	ctx, _ := context.WithTimeout(context.Background(), 10*time.Second)
+	collection := client.Database("ODA").Collection("appointments")
+	var result []model.Appointment
+
+	filter := bson.M{
+		"doctorid":  doctorid,
+		"date":      date,
+		"starttime": starttime,
+	}
+
+	cursor, err := collection.Find(ctx, filter)
+	if err != nil {
+		return err
+	}
+	defer cursor.Close(ctx)
+
+	for cursor.Next(ctx) {
+		var temp model.Appointment
+		if err := cursor.Decode(&temp); err != nil {
+			return err
+		}
+		result = append(result, temp)
+	}
+	if err := cursor.Err(); err != nil {
+		return err
+	}
+
+	if len(result) >= 4 {
+		return errors.New("the selected slot is full")
+	}
+
+	date_format := "2006-01-02"
+	parsed_date, _ := time.Parse(date_format, date)
+	for i := 0; i < starttime-6; i++ {
+		parsed_date = parsed_date.Add(time.Hour)
+	}
+	parsed_date = parsed_date.Add(30 * time.Minute)
+
+	fmt.Println(parsed_date)
+	fmt.Println(time.Now())
+	if parsed_date.Before(time.Now()) {
+		return errors.New("the Booking time for the entered date has already passed")
+	}
+
+	return nil
+
+}
+
+// For Booking appointments
+// url : http://localhost:9091/user/booking?doctorid=<>&patientid=<>
+// json : { "starttime":, "date":""}
+func BookAppointment(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	var booking model.Appointment
+	var slot model.Slot
+	booking.DoctorId = r.URL.Query().Get("doctorid")
+	booking.PatientId = r.URL.Query().Get("patientid")
+	json.NewDecoder(r.Body).Decode(&slot)
+	booking.StartTime = slot.StartTime
+	booking.Date = slot.Date
+	// date_format := "2006-01-02"
+	// parsed_date, _ := time.Parse(date_format, slot.Date)
+
+	booking.BookingId = booking.PatientId + booking.Date
+
+	err := validateBookingDetails(booking.DoctorId, booking.Date, booking.StartTime)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(err.Error()))
+		return
+	}
+
+	ctx, _ := context.WithTimeout(context.Background(), 10*time.Second)
+	collection := client.Database("ODA").Collection("appointments")
+	result, err := collection.InsertOne(ctx, booking)
+	if err != nil {
+		log.Fatal(err.Error())
+	}
+	json.NewEncoder(w).Encode(result)
+
+}
+
+func GetAvailability(w http.ResponseWriter, r *http.Request) {
+	ctx, _ := context.WithTimeout(context.Background(), 10*time.Second)
+	collection := client.Database("ODA").Collection("appointments")
+	doctorid := r.URL.Query().Get("doctorid")
+	date := r.URL.Query().Get("date")
+	starttime, _ := strconv.Atoi(r.URL.Query().Get("starttime"))
+	var result []model.Appointment
+
+	filter := bson.M{
+		"doctorid":  doctorid,
+		"date":      date,
+		"starttime": starttime,
+	}
+
+	cursor, err := collection.Find(ctx, filter)
+	if err != nil {
+		return
+	}
+	defer cursor.Close(ctx)
+
+	for cursor.Next(ctx) {
+		var temp model.Appointment
+		if err := cursor.Decode(&temp); err != nil {
+			return
+		}
+		result = append(result, temp)
+	}
+	if err := cursor.Err(); err != nil {
+		return
+	}
+
+	json.NewEncoder(w).Encode(result)
+
+}
+
+func CancelBooking(w http.ResponseWriter, r *http.Request) {
+	ctx, _ := context.WithTimeout(context.Background(), 10*time.Second)
+	collection := client.Database("ODA").Collection("appointments")
+	doctorid := r.URL.Query().Get("doctorid")
+	date := r.URL.Query().Get("date")
+	patientid := r.URL.Query().Get("patientid")
+	filter := bson.M{
+		"doctorid":  doctorid,
+		"date":      date,
+		"patientid": patientid,
+	}
+
+	var dbAppointment model.Appointment
+	err := collection.FindOne(ctx, filter).Decode(&dbAppointment)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`{"message":"Appointment doesn't exist"}`))
+		return
+	}
+	cancelledAppointmentsCol := client.Database("ODA").Collection("cancelledAppointments")
+	_, err = cancelledAppointmentsCol.InsertOne(ctx, dbAppointment)
+	if err != nil {
+		log.Fatal(err.Error())
+	}
+
+	deleteCount, err := collection.DeleteOne(ctx, filter)
+	if err != nil {
+		log.Fatal(err)
+	}
+	json.NewEncoder(w).Encode(deleteCount)
 }
